@@ -1,0 +1,456 @@
+---
+title: "Hetorogeneous Treatment Effect Modeling on Forest Cover in 1986"
+author: "Polina Koroleva"
+date: "07 24 2019"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+pkg version: grf 0.10.3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("knitr")
+opts_knit$set(root.dir = "~/Dropbox/ML Paper (Paul, Merlin, Polina)/Data & Code/Data")
+require ("tinytex")
+require("rmarkdown")
+options(tinytex.verbose = TRUE)
+```
+This script runs heterogeneos treatment effect modeling of the protection policies effect on deforestation. This analysis is based on generalized random forest method (Athey, S., Tibshirani, J., & Wager, S., 2019). The analyses are carried out using the R package grf, version 0.10.3.
+
+Generalized random forests (Athey, S., Tibshirani, J., & Wager, S., 2019) is a method for non-parametric statistical estimation based on random forests (Breiman, 2001) that can be used for estimating other statistical quantities besides the expected outcome. It addresses the problem of average treatment effect estimation based on a variant of augmented inverse-propensity weighting.
+
+Causal forest method trains a model optimized on a treatment’s causal effect. Unlike random forest model that predicts the outcome μ(x)=Ε[Yi |Xi =x], generalized random forest extends this idea to allow for estimating other statistical quantities. In particular, causal forest estimates conditional average treatment effectsτ CATE =Ε[Yi(1)−Yi(0)] after being conditioned on the covariate (Yi(1) - the outcome of treated unit, Yi(0) - the outcome of control unit) . The method allows to select sub populations with different average treatment effects and to test hypotheses about the differences between the effects in different subpopulations (Athey and Imbens, 2015).Thus, it allows to evaluate the heterogeneity of the treatment among different groups. 
+
+The objective of causal forest analysis is to provide heterogeneous treatment effect estimation that yields valid asymptotic confidence intervals for the true underlying treatment effect. (Athey and Wager, 2019). The model is used to analyze the effectiveness of protection policy efforts. The motivation for building such model is to be able to design and target an intervention to maximize outcome. In this case, to evaluate the effect of protection policies on deforestation rate among the protected land units. 
+
+### Heterogeneous treatment effect modeling for protection policy evaluation
+
+Generalized random forest by Athey et al (2019) is applied to the data collected in Costa Rica trough 1960-1986. In the causal forest analysis, the model is trained on the expected HTE for every forest parcel and then applied to future potential targets. As a result, it allows to predict which areas will benefit the most from protection. 
+
+##### Upload the libraries
+
+```{r library, message = FALSE}
+# The versions of the libraries are: "tidyverse" 0.2.1, "grf" 0.10.3, "ggplot2" 3.1.0
+library(tidyverse)
+library(ggplot2)
+require(devtools)
+library(grf)
+```
+
+##### Upload the matched data
+
+This data set was created from original data by applying matching method. Matching is a neccesery procedure for studies with observational data: it is used to obtain groups of exposed and unexposed units and to ensure the compared units are as similar as possible.
+
+In observational studies matching is determined by unconfoundness assumption (treatment Wi is independent of outcomes Yi (0) and) Yi (1) conditional on Xi. It holds true when treatment assignment is random conditional on Xi.
+
+The script with matching is available at "~/Dropbox/ML Paper (Paul, Merlin, Polina)/Data & Code/Code".
+
+```{r load}
+load("matched_60.Rda")
+```
+
+The matched data "matched_60" contains 4500 observations in the treated group and 4776 in the control. For each forest unit i = 1, ..., n, a binary treatment indicator Wi is obsrerved, as well as a real-valued outcome Yi, and 55 categorical or real-valued covariates in each subset. The covariates were measured before treatment before the outcome. 
+
+##### Create randomized train and test sets 
+
+Matched data is randomized and split into the train and test subsets with 0.67 to 0.33 ratio. Such split rule is common for random forest algorithm and allowes to have enough data to train the model and then to test it. 
+
+```{r data}
+# Set seed for reproducibility of randomization
+set.seed(123)
+# Split the data to 0.67 for the train set and 0.33 to the test set. Randomize the forest units (rows)
+ind_matched_60 <- sample(1:nrow(matched_60), size = round(0.33 * nrow(matched_60)))
+# Create a train set
+matched_train60 <- matched_60[-ind_matched_60, ]
+# Create a test set
+matched_test60 <- matched_60[ind_matched_60, ]
+
+# Check the names of the columns 
+as.data.frame(colnames(matched_60)) 
+```
+
+Check the dimensions of the train and test data
+
+```{r dimension}
+dim(matched_train60)
+dim(matched_test60)
+```
+##### Set up the variables for the analysis 
+
+The variables include: X - covariates; Y - the outcome; W - the treatment assignment
+In this study covariates are the forest characteristics, the outcome is deforestation of the unit (forested - 1, deforested - 0), treatment is protection policy (protected - 1, not protected - 0). Forest characteristics include both biophysical and socioeconomic covariates, for example distance to the nearest major city, slope and poverty indexes. The full definition of the variables is available at  "~/Dropbox/ML Paper (Paul, Merlin, Polina)/Data & Code/Data".
+
+```{r variables}
+# Create varibles from the train set
+X <-matched_train60 [,c(5:57)]
+Y <- matched_train60 [,c(3)]
+W <- matched_train60[,c(4)]
+```
+
+##### Building the model
+
+Build two separate forests to obtain Y.hat (conditional mean function E[Y | X = x]) and W.hat (residual tratment [W | X = x]). Then the model is trained on these residuals.
+
+```{r residuals}
+# For Y forest, in order to get a better predictive performance in the presence of strong, smooth effect, the local linear forest is applied. It enables to improve on asymptotic rates of convergence for random forests with smooth signals, and provides substantial gains in accuracy (Friedberg, Tibshirani, Athey, 2018). 
+Y.forest = ll_regression_forest(X,Y)
+Y.hat = predict(Y.forest)$predictions
+# Separately build W.forest - regression forest for treatment and covariates. 
+W.forest = regression_forest(X,W)
+W.hat = predict (W.forest)$predictions
+```
+
+Build a pilot causal forest, that includes all feautures, Y.hat and W.hat obtained in the previous step. The causal forest is honest (honesty = TRUE). That means that the training subsample is automaticaly split in half - first half is used to grow a tree and the second half is then used to make predictions at the leaves of the tree (Wager & Athey, 2018)
+
+```{r raw model}
+# Set seed for repoducibility 
+set.seed(123)
+# Build the pilot model
+cf.raw = causal_forest(X,Y,W, Y.hat = Y.hat, W.hat = W.hat, honesty = TRUE)
+# Rank the variables on their importance for the CATE estimation
+varimp = variable_importance(cf.raw)
+# Select the most important variables (the most accurate indicators of treatment effect)
+selected.idx = which (varimp > mean(varimp))
+```
+
+##### Rank variables importance
+
+List the features X that proved to be the most useful for heterogeneous treatment analysis. If the estimates of Y.hat and W.hat are good, then the confounding effects are eliminated and we can focus only on the features that are ranked as better treatment modifiers (Athey and Wager, 2019). 
+
+```{r ranked variables}
+# Make a dataframe with the ranked features X
+cf.raw %>% 
+  variable_importance() %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(cf.raw$X.orig))%>% 
+  arrange(desc(V1))
+```
+
+Look at how many variables were selected as the most important features that will be used in the analysis.
+
+```{r dimensions best variables}
+dim(X[,selected.idx])
+```
+
+Train the final causal forest using the selected features and make predictions on the test set. Compare the results with the predictions made by the original model with all variables X. 
+
+```{r causal forest}
+# Train conditional forest on the selected features. The model is trained on the train set
+set.seed(123)
+cf = causal_forest (X[,selected.idx], Y, W,
+                    Y.hat = Y.hat, W.hat = W.hat, honesty = TRUE)
+
+# Make out-of-bag predictions using cf.raw (model with all variables) and cf (model with only selected variables) on the train set
+tau.hat_cf.raw = predict(cf.raw)$predictions
+tau.hat_cf = predict(cf)$predictions
+
+# Make predictions on the test set using cf.raw (model with all variables) and cf (model with selected variables) 
+predictions_cf.raw = predict(cf.raw, matched_test60 [,c(5:57)], estimate.variance = TRUE)$predictions
+predictions_cf = predict(cf, matched_test60 [,c(names(X[,selected.idx]))], estimate.variance = TRUE)$predictions
+```
+
+#### Omnibus tests for heterogeneity
+
+Evaluation of predictive quality and heterogeneity is motivated by the “best linear predictor” method of Chernozhukov, Demirer, Duflo, and Fernandez-Val (2018), that seeks to fit the CATE as a linear function of the out-of-bag causal forest estimates τ^(− i)( X i).
+
+"The function computes the best linear fit of the target estimand using the forest prediction (on held-out data) as well as the mean forest prediction as the sole two regressors. A coefficient of 1 for ‘mean.forest.prediction‘ suggests that the mean forest prediction is correct, whereas a coefficient of 1 for ‘differential.forest.prediction‘ additionally suggests that the forest has captured heterogeneity in the underlying signal. The p-value of the ‘differential.forest.prediction‘ coefficient also acts as an omnibus test for the presence of heterogeneity: If the coefficient is signif- icantly greater than 0, then we can reject the null of no heterogeneity".(https://cran.r-project.org/web/packages/grf/grf.pdf)
+
+```{r calibration test}
+test_calibration(cf.raw)
+test_calibration(cf)
+```
+The results show that the `cf.raw` model got slightly better results for both `mean.forest.prediction` and `dofferential.forest.prediction`. It predicts CATE very well but underestimates the heterogeneity . If running analysis with all variables is expensive, the `cf` model with only the best treatment modifiers could be used. However, in order to maximize predictive quality of with of the model,  `cf.raw` model that was built using all the variables will be used for the analysis.
+
+##### Plot treatment effect distribution for the train and test sets
+
+Alternative way to check the quality of the model is to visualize the treatment effect for the test and train sets and compare the results. The histograms show the predictive quality of two models. Treatment effect for train test (Tau.hat) and test set (predictions) should be consistent with each other. 
+
+```{r}
+# Compare out-of-bag treatment effect (tau.hat) distribution with the predicted treatment effect made on the separate test set (predictions). 
+
+# Histogram of the treatment effect obtained with the original model (cf.raw)
+hist(tau.hat_cf.raw, col=rgb(0,0,1,1/4)) # train set
+hist(predictions_cf.raw, col=rgb(1,0,0,1/4)) # test set
+
+```
+
+
+The graphs look consistent with each other. To make the comparison easier, obtained treatment effect is split intro quantiles and then plot together for both out-of-bag train and test sets. The consistensy of the treatment effect estimates shows the good prediction quality of the model. 
+
+```{r prediction, echo = FALSE}
+# Create quantiles from treatment effect in test set (group data into 10 blocks)
+predicted86<-quantile(predictions_cf.raw, prob = seq(0, 1, length = 10), type = 5)
+# Create quantiles from treatment effect in train set (group data into 10 blocks)
+train86<- quantile(tau.hat_cf.raw, prob = seq(0, 1, length = 10), type = 5)
+# Combine the columns with train and test data in one data set
+df5 <- c (train86,predicted86)
+# Create names for the data
+type <-c(rep("tau.hat_train set", 10), rep("tau.hat_test set", 10))
+# Create a column with decile numbers
+decile<-(rep(1:10,2))
+# Combine data, names and decile numbers in one data set
+mydata1 <-data.frame(df5,decile,type)
+# Buld a ggplot
+p <-ggplot(mydata1, aes(x =factor(decile),df5))
+p +geom_bar(stat = "identity", aes(fill = type), position = "dodge")+
+  scale_x_discrete (breaks = seq(1, 10, 1))+
+  scale_y_continuous(labels=scales::percent)+
+  ylab ("Treatment Effect")+
+  xlab("Predicted Treatment Effect Decile")+
+  ggtitle("Treatment Effect on Deforestation in 1986") +
+  theme_bw()
+```
+The plot also shows significant heterogeneity in the treatment effect. The next step is to estimate conditional average treatment effect and to evaluate the heterogeneity 
+
+#### Conditional average treatment effect (CATE)  
+
+Calculate CATE over all population and CATT over treated units. CATE overlap is used to obtain CATE when the propensity score is not bounded away from 0 and 1. 
+
+```{r CATE, warning= FALSE}
+ATE = average_treatment_effect(cf.raw)
+paste("95% CI for the ATE:", round(ATE[1], 3),
+      "+/-", round(qnorm(0.975) * ATE[2], 3))
+
+ATT = average_treatment_effect(cf.raw, target.sample = "treated")
+paste("95% CI for the ATT:", round(ATT[1], 3),
+      "+/-", round(qnorm(0.975) * ATT[2], 3))
+
+ATEO = average_treatment_effect(cf.raw, target.sample = "overlap")
+paste("95% CI for the ATE overlap:", round(ATEO[1], 3),
+      "+/-", round(qnorm(0.975) * ATEO[2], 3))
+```
+
+#### Heterogeneity evaluation
+
+Evaluation of the treatment effect heterogeneity is obtained by calculating the difference between the highest and the lowest estimates of CATE. 
+
+```{r heterogeneity, warning = FALSE}
+# The _train_ set is split into two: subset wih the CATE above the median and subset with the CATE below the median. The CATE are calculated for each of the subsets. 
+high_effect = tau.hat_cf.raw > median (tau.hat_cf.raw)
+ate.high = average_treatment_effect (cf, subset = high_effect)
+ate.low = average_treatment_effect (cf, subset = !high_effect)
+ate.high
+ate.low
+
+
+# Compare regions with high and low estimated CATEs. This is an indicator of heterogeneity of the treatment effect
+paste("95% CI for difference in ATE (high and low):",
+      round(ate.high[1] - ate.low[1], 3), "+/-",
+      round(qnorm(0.975) * sqrt(ate.high[2]^2 + ate.low[2]^2), 3))
+```
+
+### Targetting units with the highest CATE vs targeting random
+
+For the application purposes, it is useful to know how much more effective it is to follow the recommendations of this model versus randomly protecting forest units. To test this, we look at the CATE of protection policy on the half of the units picked in random compare to the effect on units with highest CATE. 
+
+```{r high CATE vs random}
+# Compare regions with high estimated CATEs and random (on train set)
+set.seed(123) # reproducibility
+random_sample = sample(c(TRUE,FALSE),6215, TRUE) # randomize the CATE
+cf.raw$random_sample <- random_sample
+ate.random = average_treatment_effect(cf.raw, subset = random_sample, target.sample="control")
+
+paste("95% CI for difference in ATE in test set (high and random):",
+      round(ate.high[1] - ate.random[1], 3), "+/-",
+      round(qnorm(0.975) * sqrt(ate.high[2]^2 + ate.random[2]^2), 3))
+```
+The difference shows that targeting units recommended by the algorithm would double the CATE.
+
+##### Treatment effect comparison using regression
+##### Train set
+Evaluation of treatment effect heterogeneity using linear regression. Compare targeting the half of the forest units with biggest predicted treatment effect with the treatment effect on a random half of the sample using regression. 
+
+```{r lm}
+# Train set
+# Highest treatment effect 
+matched_train60$preds<-tau.hat_cf.raw
+lm1<- lm (for.97 ~ prot, matched_train60[matched_train60$preds > median(matched_train60$preds), ])
+summary(lm1)$coef
+
+
+# Smallest treatment effect
+lm2 <- lm(for.97 ~ prot, matched_train60[matched_train60$preds < median(matched_train60$preds), ])
+summary(lm2)$coef
+
+# Random half of the sample 
+set.seed(123)
+cases11<- sample(1:nrow(matched_train60), size = round(0.5 * nrow(matched_train60)))
+lm3 <- lm(for.97 ~ prot,
+          matched_train60[cases11, ])
+summary(lm3)$coef
+```
+##### Test set
+
+```{r lm test} 
+# Test set
+# Results for targeting the half of the sample with biggest predicted treatment effect
+matched_test60$preds<-predictions_cf.raw
+lm11 <- lm(for.97 ~ prot, matched_test60[matched_test60$preds > median(matched_test60$preds), ])
+summary(lm11)$coef
+
+
+# Results for targeting the half of the sample with SMALLEST predicted treatment effect
+lm22 <- lm(for.97 ~ prot, matched_test60[matched_test60$preds < median(matched_test60$preds), ])
+summary(lm22)$coef
+
+#Compare to naive targeting
+set.seed(1839)
+cases1<- sample(1:nrow(matched_test60), size = round(0.5 * nrow(matched_test60)))
+lm33 <- lm(for.97 ~ prot,
+         matched_test60[cases1, ])
+summary(lm33)$coef
+```
+
+##### Relationship between the top four variables and predicted treatment effects
+In order to ensure that our findings do not violate the priors we plot the relationship between top four variables that contributed the most to heterogeneity of TE and their predicted treatment effect using linear regression.
+
+```{r gam plot, warnings = FALSE, message= FALSE, echo=FALSE,results='hide',fig.keep='all'}
+# Plot results using "gam"
+p1 <- ggplot(matched_test60, aes(x = for60per, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "auto", span = 3) +
+  theme_light()
+
+p2 <- ggplot(matched_test60, aes(x = drd, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "auto", span = 3) +
+  theme_light()
+
+p3 <- ggplot(matched_test60, aes(x = popden73, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "auto", span = 4) +
+  xlim(0, 0.06)+
+  theme_light()
+
+p4 <- ggplot(matched_test60, aes(x = luc4per, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "auto", span = 3) +
+  theme_light()
+
+cowplot::plot_grid(p1, p2, p3, p4)
+```
+
+These graphs show the relationship between the variables and the treatment effect. They can help by giving some insight on what units to target in case it is not feasible to use the model directly. For instance, one can expect protection policy to be more effective at the land most suitable for agriculture (top, luc4per). However, no conclusions should be drowned directly from these relationships because variables do not exist independently, and their interactions are complex.
+
+```{r loess plot, echo=FALSE,results='hide',fig.keep='all'}
+# Plot results using "loess"
+p1 <- ggplot(matched_test60, aes(x = for60per, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "loess", span = 3) +
+  theme_light()
+
+p2 <- ggplot(matched_test60, aes(x = drd, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "loess", span = 3) +
+  theme_light()
+
+p3 <- ggplot(matched_test60, aes(x = popden73, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "loess", span = 4) +
+  xlim(0, 0.06)+
+  theme_light()
+
+p4 <- ggplot(matched_test60, aes(x = luc4per, y = preds)) +
+  geom_point() +
+  geom_smooth(method = "loess", span = 3) +
+  theme_light()
+
+cowplot::plot_grid(p1, p2, p3, p4)
+```
+
+Moving further, the heterogeneity of the effect is evaluated graphically. Plot predicted treatment effects by their rank.
+
+```{r heterogeneity plot, echo=FALSE,results='hide',fig.keep='all'}
+# Heterogeneity plot
+plot_htes <- function(predictions, ci = FALSE, z = 1.96) {
+  out <- ggplot(
+    mapping = aes(
+      x = rank(predictions_cf.raw), 
+      y = predictions_cf.raw
+    )
+  ) +
+    geom_point() +
+    labs(x = "Rank", y = "Estimated Treatment Effect") +
+    theme_light()
+  
+  if (ci && nrow(predictions_cf.raw$variance.estimates) > 0) {
+    out <- out +
+      geom_errorbar(
+        mapping = aes(
+          ymin = predictions_cf.raw$predictions + z * sqrt(predictions_cf.raw$variance.estimates),
+          ymax = predictions_cf.raw$predictions - z * sqrt(predictions_cf.raw$variance.estimates)
+        )
+      )
+  }
+  
+  return(out)
+}
+
+plot_htes(predictions)
+
+```
+
+One more approach of HTE model evaluation consists of sorting treated and control test observations in ascending order of predicted uplift, separately. Both groups are then binned into deciles and the model performance is evaluated through the pairwise difference in the uplift average per decile. 
+
+```{r model evaluation}
+# Get all the treated variables in a separate dataset
+treated<- matched_test60[matched_test60$prot == 1,c(59)] #1555
+# All control variables in a separate dataset
+untreated<-matched_test60[matched_test60$prot == 0,c(59)] #1506
+# Create quantiles from treated and control datasets (group data into 10 blocks)
+treated<-quantile(treated, prob = seq(0, 1, length = 10), type = 5)
+untreated<-quantile(untreated, prob = seq(0, 1, length = 10), type = 5)
+# Combine treated and control groups in one dataset
+df55<-c(treated, untreated)  
+# Create names for the treated and control units, put it in decile format
+type55 <-c(rep("treated", 10), rep("control", 10))
+# Create a column with decile numbers
+decile<-(rep(1:10,2))
+# Combine the columns in one data set
+mydata55 <-data.frame(df55,decile,type55)
+
+# Create ggplot with the data
+p <-ggplot(mydata55, aes(x =factor(decile),df55))
+p +geom_bar(stat = "identity", aes(fill = type55), position = "dodge")+
+  scale_x_discrete (breaks = seq(1, 10, 1))+
+  scale_y_continuous(labels=scales::percent)+
+  ylab ("Treatment Effect")+
+  xlab("Predicted Treatment Effect Decile")+
+  ggtitle("Treatment Effect on Treated and Control Observations. 1986") +
+  theme_bw()
+
+```
+
+
+#### Dictionary 
+
+*Heterogeneous treatment effect* -  variation in the response of the individuals (units) to the treatment.
+
+*Honest trees* - the tree is honest if, for each training example i , it only uses the response Yi to estimate the within-leaf treatment effect τ or to decide where to place the splits, but not both. (Wager and Athey, 2018). This approach is used in to order to avoid overfitting and reduce bias in trees predictions
+
+*Machine learning* - the task of extracting “implicit, previously unknown, and potentially useful information from data”
+
+*Matching* - a procedure that divides a group of N subjects into pairs to minimize covariate differences within pairs. A method that aims to equate the distribution of covariates in the treated and control groups.
+
+*Out-of-bag estimate * - prediction error calculation on the training set, by only including the trees in the calculation of a row's error where that row was not included in training that tree. This allows to see whether the model is over-fitting, without needing a separate validation set.
+
+
+
+#### References
+Athey, S., & Imbens, G. W. (2015). Machine Learning Methods for Estimating Heterogeneous Causal Effects *. Retrieved from arxiv.org/pdf/1504.01132v1.pdf
+
+Athey, S., Tibshirani, J., & Wager, S. (2019). Generalized random forests. The Annals of Statistics, 47(2), 1148–1178. https://doi.org/10.1214/18-AOS1709
+
+Athey, S., & Wager, S. (2019). Estimating Treatment Effects with Causal Forests: An Application. Retrieved from arxiv.org/pdf/1902.07409.pdf
+
+Chernozhukov, V., Demirer, M., Duflo, E., & Fernandez-Val, I. (2018.). Generic Machine Learning Inference on Heterogenous Treatment Effects in Randomized Experiments. Retrieved from arxiv.org/pdf/1712.04802.pdf
+
+Friedberg, R., Tibshirani, J., Athey, S., & Wager, S. (2018). Local Linear Forests. Retrieved from gssdataexplorer.norc.org/variables/191/vshow
+
+Gutierrez, P., & Gérardy, J.-Y. (2016). Causal Inference and Uplift Modeling A review of the literature (Vol. 67). Retrieved from proceedings.mlr.press/v67/gutierrez17a/gutierrez17a.pdf
+
+Wager, S., & Athey, S. (2018). Estimation and Inference of Heterogeneous Treatment Effects using Random Forests. Journal of the American Statistical Association, 113(523), 1228–1242. https://doi.org/10.1080/01621459.2017.1319839
+
+White H. White (2018). Explicitly Optimizing on Causal Effects via the Causal Random Forest: A Practical Introduction and Tutorial. URL: www.Markhw.Com/blog/causalforestintro. Accessed on 9 May 2019
